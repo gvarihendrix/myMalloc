@@ -54,7 +54,6 @@ team_t team = {
 
 #define WSIZE 4
 #define DSIZE 8
-#define OVERHEAD 16 // For the footer and header overhead
 #define CHUNKSIZE (1 << 12)
 
 
@@ -63,7 +62,7 @@ team_t team = {
 
 #define PACK(size, val) ((size)|(val))
 /* Minimum block size */
-#define MIN_BLOCK_SIZE (OVERHEAD)
+#define MIN_BLOCK_SIZE 24
 
 #define GET_SIZE(p) (GET(p) & ~(ALIGNMENT -1))
 #define GET_ALLOC(p) (GET(p) & 0x1)
@@ -76,7 +75,9 @@ team_t team = {
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
 
 
-/* TAG_USED is the bit mask used in size_tag to mark a block as used */
+/* TAG_USED is the bit mask used in size_tag to mark a block as used, 
+ * and NOT_USED that marks block as not in use
+ */
 #define TAG_USED 1
 #define NOT_USED 0
 
@@ -89,11 +90,14 @@ team_t team = {
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 #define BLK_HDR_SIZE ALIGN(sizeof(chunk))
 
+// Global variable to the beginning of the heap list
 static char *heaplist;
-static char *prolouge;
 
+// My memeory block, only used in the free list
 typedef struct mm_block chunk;
 
+// What i store inside a free block, was done 
+// just for the ease of pointer manipulation
 struct mm_block {
     size_t size;
     chunk *next;
@@ -103,17 +107,19 @@ struct mm_block {
 /* function prototypes for the free list */
 static void insert_free_block(chunk *, size_t);
 static void remove_free_block(chunk *, size_t);
-static int in_heap(void *);
+
 
 /* function prototypes for internal calls */
 static void *coalesce(void *);
 static void *find_fit(size_t );
 static void place(void *, size_t );
 static void *extend_heap(size_t );
+static int in_heap(void *);
+
+/* Functions used to debug the shit out of this */
 void print_heap();
 void print_free_list();
 void heap_cheack();
-static int greter_than_zero(size_t);
 static int checkblock(void *);
 static void printblock(void *);
 int mm_check();
@@ -128,33 +134,28 @@ int mm_init(void)
 {   // Head of the free list
     chunk *bp = mem_sbrk(BLK_HDR_SIZE);
     bp->size = BLK_HDR_SIZE;
-    bp->next = bp;
-    bp->prev = bp;
-    //insert_free_block(bp, BLK_HDR_SIZE);
-    //checkblock(bp);
-    //printblock(bp);
-    //PUT(bp + WSIZE, PACK(bp->size, TAG_USED));
-    //PUT(bp + DSIZE, PACK(bp->size, TAG_USED));
+    bp->next = bp;  // Point to itself so we dont get segemntation fault
+    bp->prev = bp;  // My prev pointer has no footer size, so this is like my 
+                    // epilouge header that can not and will not work with
     
     if ((heaplist = mem_sbrk(4 * WSIZE)) == NULL)
         return -1;
 
-    PUT(heaplist, NOT_USED);
-    PUT(heaplist + WSIZE , PACK(DSIZE, TAG_USED));
-    PUT(heaplist + DSIZE , PACK(DSIZE, TAG_USED));
-    PUT(heaplist + WSIZE + DSIZE, PACK(0, TAG_USED));
-    prolouge  = heaplist + WSIZE;
+    PUT(heaplist, NOT_USED); /* Alignment padding */                   
+    PUT(heaplist + WSIZE , PACK(DSIZE, TAG_USED)); /* Prolouge header */
+    PUT(heaplist + DSIZE , PACK(DSIZE, TAG_USED)); /* Prolouge footer */
+    PUT(heaplist + WSIZE + DSIZE, PACK(0, TAG_USED)); /* Epilouge header */
      
     heaplist += DSIZE;
-
+    /* Extend the empty heap with a free block of chunksize bytes */
     if (extend_heap(CHUNKSIZE/WSIZE) == NULL)
         return -1;
 
     return 0;
 }
 
-/* (chunk *) 
- * mm_malloc - Allocate a block by incrementing the brk pointer.
+/*
+ * mm_malloc 
  *     Always allocate a block whose size is a multiple of the alignment.
  */
 void *mm_malloc(size_t size)
@@ -162,26 +163,21 @@ void *mm_malloc(size_t size)
     size_t req_size;
     size_t extendsize;
     char *bp;
-
     /* Ignore spurious requests */
     if (size <= 0)
         return NULL; 
     
     if(size <= DSIZE)
-        req_size = MIN_BLOCK_SIZE + DSIZE; // Need to have the mininum amount of bytes 24
+        req_size = MIN_BLOCK_SIZE; // Need to have the mininum amount of bytes 24, or i will run into problems :P
     else
         req_size = DSIZE  * ((size + (DSIZE) +  DSIZE - 1) / DSIZE);
-
-    /*if (mm_check() < 0) {
-        print_heap();
-        printf("Error in mm_check, in malloc\n");
-    }**/
 
     if ((bp = find_fit(req_size)) != NULL) { 
         place(bp, req_size);
         return bp;
     }
     
+    /* Will be called if the heap is not big enough for the req_size */
     extendsize = MAX(req_size, CHUNKSIZE);
     if((bp  =  extend_heap(extendsize/WSIZE)) == NULL)
         return NULL;
@@ -194,24 +190,19 @@ void *mm_malloc(size_t size)
  * mm_free - Freeing a block does nothing.
  */
 void mm_free(void *ptr)
-{
-
-    if (ptr == NULL)
+{   
+    /* Just basic checks, if the pointer is NULL or not in the heap
+     * or its free then return 
+     */
+    if (ptr == NULL || !in_heap(HEADER(ptr)) || GET_ALLOC(HEADER(ptr)) == 0)
         return;
     
-    /*if (mm_check() < 0) {
-        printf("Error in mm_check\n");
-    }
-    if (free_list_consistency() < 0) {
-        printf("Error int free_list_consitency\n");
-    }
-    */
-
+    /* Takes in the pointer and gets its header size */
     size_t size = GET_SIZE(HEADER(ptr));
-
+    /* Set its header and footer in the heaplist to be not used */
     PUT(HEADER(ptr), PACK(size, NOT_USED));
     PUT(FOOTER(ptr), PACK(size, NOT_USED));
-
+    // Try to coalesce it
     coalesce(ptr);
 
 }
@@ -225,21 +216,25 @@ void *mm_realloc(void *ptr, size_t size)
         mm_free(ptr);
         return NULL;
     }
-
+    
     if (ptr == NULL)
         return mm_malloc(size);
 
-    void* newPtr = mm_malloc(size);
+    if(!in_heap(ptr))
+        return mm_malloc(size);
     
-    if (newPtr == NULL)
-        return NULL;
+    size_t size_ptr = GET_SIZE(HEADER(ptr));
 
-    int copysize = GET_SIZE(HEADER(ptr));
-    if(size < copysize)
-        copysize = size;
+    void *newPtr= mm_malloc(size);
+    
+    if (newPtr != NULL) {
 
-    memmove(newPtr, ptr, copysize);
-    mm_free(ptr);
+        if(size < size_ptr)
+            size_ptr = size;
+
+        memmove(newPtr, ptr, size_ptr);
+        mm_free(ptr);
+    }
     return newPtr;
 
    
@@ -254,17 +249,16 @@ static void* coalesce(void *bp)
 {
 
     size_t prev_alloc;
-    size_t next_alloc;
-    if (!in_heap(PREV_BLKP(bp)))  // || ((char *)(bp)-(3*WSIZE)) == prolouge)
+    size_t next_alloc = GET_ALLOC(HEADER(NEXT_BLKP(bp)));
+    /* Need to check of prev block is in the heap
+     * if not prev alloc is assigned the value 1 wich
+     * meens its taken, else its in the heap list and its
+     * safe to get it 
+     */
+    if (!in_heap(PREV_BLKP(bp)))
         prev_alloc = 1;
     else 
-        prev_alloc = GET_ALLOC(FOOTER(PREV_BLKP(bp))); 
-
-    
-    if (!in_heap(NEXT_BLKP(bp)))
-        next_alloc = 1;
-    else
-        next_alloc = GET_ALLOC(HEADER(NEXT_BLKP(bp)));
+        prev_alloc = GET_ALLOC(FOOTER(PREV_BLKP(bp)));     
     
     size_t size = GET_SIZE(HEADER(bp));
 
@@ -273,7 +267,7 @@ static void* coalesce(void *bp)
         return bp;
     }
 
-    else if (prev_alloc && !next_alloc) {
+    else if (prev_alloc && !next_alloc) { // If next is not alloc, but prev is alloc
         
         remove_free_block((chunk *) NEXT_BLKP(bp), GET_SIZE(HEADER(NEXT_BLKP(bp))));
         size += GET_SIZE(HEADER(NEXT_BLKP(bp)));         
@@ -282,28 +276,31 @@ static void* coalesce(void *bp)
         PUT(FOOTER(bp), PACK(size, NOT_USED));
     }
 
-    else if (!prev_alloc && next_alloc) {
+    else if (!prev_alloc && next_alloc) { // If prev is not alloc, but next is alloc
         size += GET_SIZE(HEADER(PREV_BLKP(bp)));
         
         PUT(FOOTER(bp), PACK(size, NOT_USED));
         PUT(HEADER(PREV_BLKP(bp)), PACK(size, NOT_USED));
         bp = PREV_BLKP(bp);
         
-
+        // We romeve the block after point bp to its prev block
         remove_free_block((chunk *) bp, GET_SIZE(HEADER(bp)));
     }
 
     else {
-        size += GET_SIZE(HEADER(PREV_BLKP(bp))) + GET_SIZE(FOOTER(NEXT_BLKP(bp)));
+        /* Prev and next are not allocated its safe to free them */
 
+        size += GET_SIZE(HEADER(PREV_BLKP(bp))) + GET_SIZE(FOOTER(NEXT_BLKP(bp)));
+        // We need to remove the prev and next from the free list so we can join them together 
         remove_free_block((chunk *) PREV_BLKP(bp), GET_SIZE(HEADER(PREV_BLKP(bp))));
         remove_free_block((chunk *) NEXT_BLKP(bp), GET_SIZE(FOOTER(NEXT_BLKP(bp))));
-
+        
+        // Assign the the heaplist that these blocks are free
         PUT(HEADER(PREV_BLKP(bp)), PACK(size, NOT_USED));
         PUT(FOOTER(NEXT_BLKP(bp)), PACK(size, NOT_USED));
         bp = PREV_BLKP(bp);
     }
-
+    // insert the newly created bigger block into the freelist 
     insert_free_block((chunk *) bp, size);
     return bp;
 
@@ -318,19 +315,18 @@ static void* extend_heap(size_t words)
 {
     size_t size;
     char *bp;
-
+    // Just to keep everything aligned like in the book
     size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
 
     if((long)(bp = mem_sbrk(size)) == -1) // If true i dont want to live
         return NULL;
-       
-    assert(size > 0);
-
-    PUT(HEADER(bp), PACK(size, NOT_USED));
-    PUT(FOOTER(bp), PACK(size, NOT_USED));
-    PUT(HEADER(NEXT_BLKP(bp)), PACK(0, TAG_USED));
     
-    return coalesce(bp);
+    /* Initialize free block header/footer and the epilouge header */
+    PUT(HEADER(bp), PACK(size, NOT_USED)); // Free block header
+    PUT(FOOTER(bp), PACK(size, NOT_USED)); // Free block footer
+    PUT(HEADER(NEXT_BLKP(bp)), PACK(0, TAG_USED)); // New epilouge header
+    
+    return coalesce(bp); // Coalesce with any adjecant block thats free
 }
 
 
@@ -338,13 +334,18 @@ static void* extend_heap(size_t words)
 static void* find_fit(size_t asize)
 {  
     chunk *p;
-
+    /* Simple first fit search 
+     * going trough the free list and if we find a block big 
+     * enough for the request size we stop or if we go a hole circle 
+     * trough the explicit list
+     */
     for (p = ((chunk *)mem_heap_lo())->next; 
             p != mem_heap_lo() && p->size < asize; p = p->next);
-
-    if(p != mem_heap_lo()){
-        return  (void *) p;
-    }
+    
+    // If p has not gone the full circle return it 
+    // else we did not find anything
+    if(p != mem_heap_lo())
+        return   p;
     else
         return NULL;
 }
@@ -363,12 +364,10 @@ static void insert_free_block(chunk *bp, size_t size)
 }
 
 
-/* When allocated remove free block */
+/* When allocated, remove free block */
 static void remove_free_block(chunk *bp, size_t size) 
 {
-
-    bp->size = size | TAG_USED;
-    assert(bp->size > 0);
+    bp->size = size | TAG_USED; 
     bp->prev->next = bp->next;
     bp->next->prev = bp->prev;
 }
@@ -380,18 +379,16 @@ static void remove_free_block(chunk *bp, size_t size)
  */
 static void place(void *bp, size_t asize)
 {
-
     size_t size_of_bp = GET_SIZE(HEADER(bp));
     size_t split_size = size_of_bp - asize; 
 
-    if (split_size >= (DSIZE * 3)) { // I need to have it 24 bytes min to split, else it will crash on a segmentation fault
+    if (split_size >= (MIN_BLOCK_SIZE)) { // I need to have it 24 bytes min to split, else it will crash on a segmentation fault
                                      // Could not find out how to fix it :(.
         PUT(HEADER(bp), PACK(asize, TAG_USED)); 
         PUT(FOOTER(bp), PACK(asize, TAG_USED));
         remove_free_block((chunk*) bp, asize);
 
         bp = NEXT_BLKP(bp);
-
 
         PUT(HEADER(bp), PACK(split_size, NOT_USED));
         PUT(FOOTER(bp), PACK(split_size, NOT_USED));
@@ -406,13 +403,6 @@ static void place(void *bp, size_t asize)
     }
 }
 
-static int greter_than_zero(size_t size)
-{
-    if (size < 0)
-        return 0;
-    else 
-        return 1;
-}
 
 static int in_heap(void *bp)
 {
@@ -422,10 +412,10 @@ static int in_heap(void *bp)
         return 0; // False not in the heap
 }
 
-
+// Debugging function 
 static int checkblock(void *bp)
-{
-    if ((size_t)bp % 8) {
+{   
+    if (GET_SIZE(HEADER(bp)) % 8) {
         printf("Error: %p is not doubleword aligned\n", bp);
         return -1;
     }
@@ -438,6 +428,7 @@ static int checkblock(void *bp)
     return 0;
 }
 
+// Debugging function
 static void printblock(void *bp)
 {
     size_t hsize, halloc, fsize, falloc;
@@ -451,6 +442,8 @@ static void printblock(void *bp)
             hsize, (halloc ? "alloc" : "free"), fsize, (falloc ? "alloc" : "free"));
 }
 
+
+// Debugging function
 int mm_check()
 {
     void *bp = heaplist;
@@ -466,7 +459,6 @@ int mm_check()
     }
 
     for ( bp = heaplist; GET_SIZE(HEADER(bp)) > 0; bp = NEXT_BLKP(bp)) {
-        //printblock(bp);
         if ( checkblock(bp) < 0) {
             printblock(bp);
             printf("this block is not right\n");
@@ -482,19 +474,20 @@ int mm_check()
     return 0;
 }
 
-
+// Debbuging function
 void heap_check()
 {
     void *bp = heaplist;
     printf("Checking the heap for consintency\n");
     printf("Does the heap size align to the 8 byte alignment? %s\n", ((mem_heapsize() % 8) == 0 ? "true": "false")); 
     while(in_heap(bp)) {
-        printf("Pointer %p is %s \n", bp,  (in_heap( bp) == 0 ? "not in the heap" : "is in the heap"));
+        printf("Pointer %p is %s \n", bp,  (in_heap(bp) == 0 ? "not in the heap" : "is in the heap"));
         printf("Is every block using alignment of 8 bytes? %s\n", ((GET_SIZE(HEADER(bp)) % 8) == 0 ? "true" : "false"));
         bp = NEXT_BLKP(bp);
     }
 }
 
+// Debugging function
 void print_heap(){
     void *bp = heaplist;
     while(in_heap(bp)){
@@ -506,6 +499,7 @@ void print_heap(){
     }
 }
 
+// Debugging function 
 void print_free_list() {
     chunk *bp = ((chunk *)mem_heap_lo());
     int count = 0;
@@ -519,17 +513,17 @@ void print_free_list() {
     printf("Number of blocks in the free list %d\n", count);
 }
 
+// Debugging function
 int free_list_consistency() {
     chunk *bp =  (chunk *)mem_heap_lo();
     do {
+        
         if (checkblock(bp) < 0){
             printblock(bp);
             printf("This pointer %p is not doing its job\n", bp);
             return -1;;
         }
         bp = bp->next;
-
-        assert(bp != NULL);
         
     } while(bp != mem_heap_lo());
     
